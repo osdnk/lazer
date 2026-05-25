@@ -23,8 +23,8 @@ from labrador import LAB_RING_40
 
 if __name__ == "__main__":
     ok = run_demo(
-        k=10,                # 2**10 = 1024 leaves
-        t=6,                 # arity (>= 2n so the height-2 hash compresses)
+        k=14,                # 2**10 = 1024 leaves
+        t=8,                 # arity (>= 2n so the height-2 hash compresses)
         n=2,                 # Ajtai hash height -- estimator's 128-bit choice (~147-bit)
         base=8,              # base-8 gadget: digits in [0,8), genuine L2 bound
         lab_ring=LAB_RING_40,

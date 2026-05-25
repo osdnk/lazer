@@ -138,6 +138,30 @@ def compute_tree_shape(num_leaves, t, n):
 #  The proof builder                                                          #
 # --------------------------------------------------------------------------- #
 
+class LabradorProof:
+    """A produced proof: LaBRADOR's witness commitment + the succinct argument.
+
+    `witness_commitment` and `argument` are the two C structs returned by
+    `composite_prove_simple`; `verify()` consumes both plus the public statement.
+    They are owned by the originating AjtaiMerkleProof (kept alive via `_amp`);
+    this build of the wrapper does not serialise them to bytes, so keep the object
+    around rather than expecting to pickle it.
+    """
+
+    def __init__(self, amp, witness_commitment, argument, prove_secs):
+        self._amp = amp                       # keep owner (and its C memory) alive
+        self.witness_commitment = witness_commitment
+        self.argument = argument
+        self.prove_secs = prove_secs
+        try:
+            self.size_kb = float(argument.size)   # composite.size field (KB)
+        except Exception:
+            self.size_kb = float("nan")
+
+    def __repr__(self):
+        return f"<LabradorProof argument≈{self.size_kb:.1f} KB + witness commitment>"
+
+
 class AjtaiMerkleProof:
     """Build a LaBRADOR statement+witness proving Ajtai-Merkle well-formedness.
 
@@ -292,7 +316,10 @@ class AjtaiMerkleProof:
 
         deg_list = [self.d] * self.num_witnesses
         npols_list = list(self.WV_npols)
-        norm_list = [self._betasq(c) for c in npols_list]
+        if getattr(self, "tight_norms", False):
+            norm_list = [max(1, self.WV[i].l2sqr()) for i in range(self.num_witnesses)]
+        else:
+            norm_list = [self._betasq(c) for c in npols_list]
 
         PS = proof_statement(deg_list, npols_list, norm_list,
                              self.num_constraints, self.primesize)
@@ -344,33 +371,65 @@ class AjtaiMerkleProof:
             if bnd > 0:
                 assert self.WV[idx].l2sqr() <= bnd, f"witness {idx} exceeds L2 bound"
 
-    # -- prove + verify ------------------------------------------------------
+    # -- commitment / prove / verify (three separable phases) ----------------
     def total_witness_polys(self):
         return sum(self.WV_npols)
 
-    def prove_and_verify(self, run_smpl_verify=True):
-        """Run pack_prove + pack_verify. Returns (ok, prove_secs, verify_secs)."""
+    @property
+    def commitment(self):
+        """The public commitment to the 2**k leaves: the Ajtai-Merkle root in R_q^n.
+
+        Produced by build() purely by hashing -- no proving involved.  Publishing
+        this binds the prover to the whole tree; the proof below shows it is well
+        formed (i.e. that a short witness hashing to this root is known).
+        """
+        assert self.root is not None, "call build() first"
+        return self.root
+
+    def _verify_fn(self):
+        return {
+            "24": lib.labrador24_composite_verify_simple,
+            "32": lib.labrador32_composite_verify_simple,
+            "40": lib.labrador40_composite_verify_simple,
+            "48": lib.labrador48_composite_verify_simple,
+        }[self.primesize]
+
+    def prove(self, run_smpl_verify=False):
+        """Run the LaBRADOR prover. Returns a LabradorProof (commitment + argument).
+
+        The returned object's `witness_commitment` is LaBRADOR's binding
+        commitment to the secret witness; `argument` is the succinct proof.  Both
+        are needed to verify; neither reveals the witness.
+        """
         assert self.PS is not None, "call build() first"
-        stmnt = self.PS.output_statement()
         if run_smpl_verify:
             self.PS.smpl_verify()
         t0 = time.perf_counter()
         err, comp, comm = self.PS.pack_prove()
-        t1 = time.perf_counter()
+        dt = time.perf_counter() - t0
         if err != 0:
-            print(f"[ERR] pack_prove failed with code {err}")
-            return False, t1 - t0, 0.0
-        # pack_verify prints "Pack Verify= <code>"; capture the actual code too.
-        if self.primesize == "24":
-            vr = lib.labrador24_composite_verify_simple(comp, comm, stmnt)
-        elif self.primesize == "32":
-            vr = lib.labrador32_composite_verify_simple(comp, comm, stmnt)
-        elif self.primesize == "40":
-            vr = lib.labrador40_composite_verify_simple(comp, comm, stmnt)
-        else:
-            vr = lib.labrador48_composite_verify_simple(comp, comm, stmnt)
-        t2 = time.perf_counter()
-        return (vr == 0), t1 - t0, t2 - t1
+            raise RuntimeError(f"pack_prove failed with code {err}")
+        return LabradorProof(self, comm, comp, dt)
+
+    def verify(self, proof):
+        """Verify a LabradorProof against this statement (uses only public data).
+
+        Reads the public statement (the matrix A, the gadget g and the root) plus
+        the proof's commitment and argument -- never the witness.  Returns bool.
+        """
+        stmnt = self.PS.output_statement()
+        return self._verify_fn()(proof.argument, proof.witness_commitment, stmnt) == 0
+
+    def prove_and_verify(self, run_smpl_verify=True):
+        """Convenience: prove() then verify(). Returns (ok, prove_secs, verify_secs)."""
+        try:
+            proof = self.prove(run_smpl_verify=run_smpl_verify)
+        except RuntimeError as e:
+            print(f"[ERR] {e}")
+            return False, 0.0, 0.0
+        t0 = time.perf_counter()
+        ok = self.verify(proof)
+        return ok, proof.prove_secs, time.perf_counter() - t0
 
 
 # --------------------------------------------------------------------------- #
@@ -404,12 +463,21 @@ def run_demo(k=6, t=6, n=2, base=8, lab_ring=LAB_RING_40,
     print(f"witness  : {amp.num_witnesses} committed digit-vectors, "
           f"{amp.total_witness_polys()} ring elements; "
           f"{amp.num_constraints} linear constraints")
-    print(f"[OK] built tree + statement + witness in {build_s:.3f}s "
-          f"(all recomposition/norm sanity checks passed)")
 
-    ok, ps, vs = amp.prove_and_verify()
-    print(f"[{'OK' if ok else 'ERR'}] prove {ps:.3f}s | verify {vs:.3f}s | "
-          f"proof {'VERIFIES' if ok else 'FAILED'}")
+    # ---- phase 1: COMMIT -- just hashing the tree, no proving --------------
+    root = amp.commitment
+    print(f"[1] COMMIT : root = {amp.n} ring elements binding all "
+          f"{amp.num_leaves} leaves  (built in {build_s:.3f}s, no proving)")
+
+    # ---- phase 2: PROVE  -- witness commitment + succinct argument ---------
+    proof = amp.prove(run_smpl_verify=True)
+    print(f"[2] PROVE  : {proof}  in {proof.prove_secs:.3f}s")
+
+    # ---- phase 3: VERIFY -- public statement + proof only (no witness) -----
+    t0 = time.perf_counter()
+    ok = amp.verify(proof)
+    print(f"[3] VERIFY : {'PROOF VERIFIES' if ok else 'PROOF FAILED'}  "
+          f"in {time.perf_counter() - t0:.3f}s")
     return ok
 
 
