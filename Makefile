@@ -6,7 +6,11 @@ CFLAGS_DEBUG = $(CFLAGS_WARN) -Og -ggdb3
 ADD_CPPFLAGS = -DNDEBUG
 
 CPPFLAGS += $(ADD_CPPFLAGS)
-LIBS = -lm $(HEXL_DIR)/build/hexl/lib64/libhexl.a -lstdc++
+# cmake's GNUInstallDirs picks lib or lib64 depending on the distro; try both.
+HEXL_LIB = $(firstword $(wildcard $(HEXL_DIR)/build/hexl/lib64/libhexl.a)\
+ $(wildcard $(HEXL_DIR)/build/hexl/lib/libhexl.a)\
+ $(HEXL_DIR)/build/hexl/lib64/libhexl.a)
+LIBS = -lm $(HEXL_LIB) -lstdc++
 
 # honor user CFLAGS
 ifdef CFLAGS
