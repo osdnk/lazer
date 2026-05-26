@@ -127,13 +127,7 @@ print("####  Ajtai-Merkle hash: minimal height n for 128-bit security  ####")
 print()
 
 # Parameters of the runnable demo (example_l2norm.py): base 8, arity t = 6.
-estimate(d=64, q=Q40, b=8, t=6, label="(L2 demo:  base 8,  t=6)")
-
-# Smaller-q view: shows the n-vs-q trade-off.  q is fixed to >= 2^40 by
-# LaBRADOR's own inner-commitment security, but this illustrates that a smaller
-# modulus would demand a larger Ajtai height n.
-estimate(d=64, q=2 ** 20 + 7, b=8, t=6, n_max=60,
-         label="(reference: if q ~ 2^20 were allowed)")
+estimate(d=64, q=Q40, b=11, t=6, label="(L2 demo:  base 8,  t=6)")
 
 print("Notes:")
 print(" * q is fixed to ~2^40 (LAB_RING_40): the smallest LaBRADOR modulus for")
